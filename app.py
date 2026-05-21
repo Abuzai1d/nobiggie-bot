@@ -22,21 +22,24 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "sk-ant-api03-__xNY_-4qd
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-state = {
-    "job_id": None,
-    "estimate": None,
-    "step": None,
-    "client_name": None,
-    "client_phone": None,
-}
+STATE_FILE = "/tmp/nobiggie_state.json"
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"job_id": None, "estimate": None, "step": None, "client_name": None, "client_phone": None}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
 
 
 def reset_state():
-    state["job_id"] = None
-    state["estimate"] = None
-    state["step"] = None
-    state["client_name"] = None
-    state["client_phone"] = None
+    save_state({"job_id": None, "estimate": None, "step": None, "client_name": None, "client_phone": None})
 
 
 def send_wa(body):
@@ -68,15 +71,9 @@ def analyze_media(media_urls):
                 for fp in sorted(glob.glob(os.path.join(tmpdir, "f_*.jpg")))[:6]:
                     with open(fp, "rb") as ff:
                         fb = base64.standard_b64encode(ff.read()).decode("utf-8")
-                    content.append({
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": "image/jpeg", "data": fb}
-                    })
+                    content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": fb}})
         else:
-            content.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": mime, "data": b64}
-            })
+            content.append({"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}})
     content.append({"type": "text", "text": ANALYSIS_PROMPT})
     resp = claude_client.messages.create(
         model="claude-sonnet-4-5",
@@ -150,6 +147,7 @@ def webhook():
         return "", 200
 
     bu = body.upper()
+    state = load_state()
 
     if state["step"] == "awaiting_edit":
         send_wa("Adjusting estimate...")
@@ -157,15 +155,18 @@ def webhook():
             updated = apply_edit(state["estimate"], body)
             state["estimate"] = updated
             state["step"] = None
+            save_state(state)
             send_wa("Updated!\n\n" + format_estimate(updated))
         except Exception as e:
             state["step"] = None
+            save_state(state)
             send_wa("Failed: " + str(e))
         return "", 200
 
     if state["step"] == "awaiting_name":
         state["client_name"] = body
         state["step"] = "awaiting_phone"
+        save_state(state)
         send_wa("Got it! Now send the client phone number:")
         return "", 200
 
@@ -195,6 +196,7 @@ def webhook():
             send_wa("No active estimate. Send a video or photo first.")
             return "", 200
         state["step"] = "awaiting_name"
+        save_state(state)
         send_wa("What is the client name?")
         return "", 200
 
@@ -203,6 +205,7 @@ def webhook():
             send_wa("No active estimate. Send a video or photo first.")
             return "", 200
         state["step"] = "awaiting_edit"
+        save_state(state)
         send_wa("What to change? Examples:\n- Make boxes 20 and price 5000\n- Remove carpenter\n- Add 1 truck\n- Set price to 4500 SR")
         return "", 200
 
@@ -217,9 +220,8 @@ def webhook():
         try:
             estimate = analyze_media(media_urls)
             job_id = "JOB-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
-            state["job_id"] = job_id
-            state["estimate"] = estimate
-            state["step"] = None
+            new_state = {"job_id": job_id, "estimate": estimate, "step": None, "client_name": None, "client_phone": None}
+            save_state(new_state)
             send_wa(format_estimate(estimate))
         except Exception as e:
             send_wa("Analysis failed: " + str(e))
