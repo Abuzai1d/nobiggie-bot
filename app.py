@@ -167,13 +167,13 @@ def process_edit_background(estimate, comment):
 def generate_quote_background(est, name, phone, job_id):
     try:
         pdf_path = generate_quote_pdf(est, name, phone, job_id)
-        with open(pdf_path, "rb") as pf:
-            up = requests.post("https://file.io/?expires=1d", files={"file": pf})
-        url = up.json().get("link", "")
+        from pdf_host import upload_pdf_to_github
+        filename = "NoBiggie_Quote_" + str(job_id) + ".pdf"
+        url = upload_pdf_to_github(pdf_path, filename)
         if url:
             send_wa("Quote ready! Forward to client:\n" + url)
         else:
-            send_wa("PDF upload failed.")
+            send_wa("PDF generated but upload failed. Try again.")
     except Exception as e:
         send_wa("Quote failed: " + str(e))
     reset_state()
