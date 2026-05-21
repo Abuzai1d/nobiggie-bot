@@ -15,28 +15,26 @@ app = Flask(__name__)
 TWILIO_SID        = os.environ.get("TWILIO_ACCOUNT_SID",     "AC4cabc297f8ef1ab124a2150c8fbc46f8")
 TWILIO_TOKEN      = os.environ.get("TWILIO_AUTH_TOKEN",      "e7ea89b810289727236c17a9ea572826")
 TWILIO_WA_NUMBER  = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
-MANAGER_NUMBER    = os.environ.get("MANAGER_WHATSAPP_NUMBER","whatsapp:+966505689200")
+MANAGER_NUMBER    = os.environ.get("MANAGER_WHATSAPP_NUMBER", "whatsapp:+966505689200")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY",      "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")
  
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
  
-# ── State ─────────────────────────────────────────────────────────────────────
-# Only one active job at a time (latest one wins)
 state = {
     "job_id": None,
     "estimate": None,
-    "step": None,          # None | "awaiting_edit" | "awaiting_name" | "awaiting_phone"
+    "step": None,
     "client_name": None,
     "client_phone": None,
 }
  
  
 def reset_state():
-    state["job_id"]       = None
-    state["estimate"]     = None
-    state["step"]         = None
-    state["client_name"]  = None
+    state["job_id"] = None
+    state["estimate"] = None
+    state["step"] = None
+    state["client_name"] = None
     state["client_phone"] = None
  
  
@@ -55,7 +53,8 @@ def analyze_media_with_claude(media_urls):
     for url in media_urls:
         b64, mime = download_media(url)
         if "video" in mime:
-            import subprocess, glob
+            import subprocess
+            import glob
             with tempfile.TemporaryDirectory() as tmpdir:
                 video_path = os.path.join(tmpdir, "video.mp4")
                 with open(video_path, "wb") as f:
@@ -72,6 +71,245 @@ def analyze_media_with_claude(media_urls):
                     content.append({
                         "type": "image",
                         "source": {"type": "base64", "media_type": "image/jpeg", "data": fb64}
+                    })
+        else:
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime, "data": b64}
+            })
+ 
+    prompt = (
+        "You are a moving estimator for NoBiggie moving company in Saudi Arabia. "
+        "Analyze the images/frames and return ONLY this JSON:\n"
+        "{\n"
+        '  "rooms": ["list of rooms"],\n'
+        '  "items": ["every item to move"],\n'
+        '  "boxes_count": 60,\n'
+        '  "trucks_count": 3,\n'
+        '  "workers_count": 4,\n'
+        '  "carpenter_needed": true,\n'
+        '  "packer_hours": 8,\n'
+        '  "special_items": ["fragile/special items"],\n'
+        '  "cost_breakdown": {\n'
+        '    "trucks": 900,\n'
+        '    "pakistani_workers": 400,\n'
+        '    "carpenter": 200,\n'
+        '    "filipino_packers_labor": 960,\n'
+        '    "filipino_packers_transport": 120,\n'
+        '    "boxes": 600,\n'
+        '    "bubble_wrap": 168,\n'
+        '    "stretch_wrap": 175,\n'
+        '    "tape": 35\n'
+        "  },\n"
+        '  "total_cost": 3558,\n'
+        '  "client_price": 5058,\n'
+        '  "summary": "2-3 sentence summary"\n'
+        "}\n"
+        "Pricing: Truck 300 SR, Worker 100 SR/day, Carpenter 200 SR/day, "
+        "Packers 30 SR/hr per person groups of 4 + 120 SR transport, "
+        "Box 10 SR, Bubble wrap 28 SR, Stretch wrap 25 SR, Tape 3.5 SR. "
+        "client_price = total_cost + 1500 SR margin. "
+        "Return ONLY valid JSON, no markdown, no extra text."
+    )
+    content.append({"type": "text", "text": prompt})
+ 
+    response = claude_client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=2000,
+        messages=[{"role": "user", "content": content}]
+    )
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return json.loads(raw.strip())
+ 
+ 
+def apply_edit(estimate, comment):
+    prompt = (
+        "Adjust this move estimate based on manager instructions.\n\n"
+        "Current estimate:\n"
+        + json.dumps(estimate, indent=2)
+        + "\n\nManager instructions: " + json.dumps(comment)
+        + "\n\nApply the changes and recalculate all costs. "
+        "client_price = total_cost + 1500 SR margin, UNLESS manager sets a specific final price. "
+        "Return ONLY updated JSON, same structure, no markdown."
+    )
+    response = claude_client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=2000,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return json.loads(raw.strip())
+ 
+ 
+def format_estimate(est):
+    cb = est.get("cost_breakdown", {})
+    items = est.get("items", [])
+    items_preview = "\n".join(["  - " + str(i) for i in items[:12]])
+    if len(items) > 12:
+        items_preview += "\n  ... +" + str(len(items) - 12) + " more"
+    special_list = est.get("special_items", [])
+    special = "\n".join(["  * " + str(i) for i in special_list]) if special_list else "  None"
+    packers = cb.get("filipino_packers_labor", 0) + cb.get("filipino_packers_transport", 0)
+    materials = cb.get("boxes", 0) + cb.get("bubble_wrap", 0) + cb.get("stretch_wrap", 0) + cb.get("tape", 0)
+ 
+    lines = [
+        "NoBiggie - Move Estimate",
+        "",
+        "Rooms: " + ", ".join(est.get("rooms", [])),
+        "",
+        "Items (" + str(len(items)) + " total):",
+        items_preview,
+        "",
+        "Special Handling:",
+        special,
+        "",
+        "Resources:",
+        "  - " + str(est.get("trucks_count", 0)) + " Trucks",
+        "  - " + str(est.get("workers_count", 0)) + " Pakistani Workers",
+        "  - " + ("1 Carpenter" if est.get("carpenter_needed") else "No Carpenter"),
+        "  - 4 Filipino Packers (" + str(est.get("packer_hours", 0)) + " hrs)",
+        "  - " + str(est.get("boxes_count", 0)) + " Boxes",
+        "",
+        "Cost Breakdown:",
+        "  Trucks: " + str(cb.get("trucks", 0)) + " SR",
+        "  Workers: " + str(cb.get("pakistani_workers", 0)) + " SR",
+        "  Carpenter: " + str(cb.get("carpenter", 0)) + " SR",
+        "  Packers: " + str(packers) + " SR",
+        "  Materials: " + str(materials) + " SR",
+        "  -------------",
+        "  Our Cost: " + str(est.get("total_cost", 0)) + " SR",
+        "  Margin: 1,500 SR",
+        "  -------------",
+        "  Client Price: " + str(est.get("client_price", 0)) + " SR",
+        "",
+        str(est.get("summary", "")),
+        "",
+        "---------------------",
+        "Reply:",
+        "APPROVE",
+        "EDIT",
+        "REJECT",
+    ]
+    return "\n".join(lines)
+ 
+ 
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    from_number = request.form.get("From", "")
+    body = request.form.get("Body", "").strip()
+    num_media = int(request.form.get("NumMedia", 0))
+ 
+    if from_number != MANAGER_NUMBER:
+        return "", 200
+ 
+    body_upper = body.upper()
+ 
+    if state["step"] == "awaiting_edit":
+        send_whatsapp(MANAGER_NUMBER, "Adjusting estimate...")
+        try:
+            updated = apply_edit(state["estimate"], body)
+            state["estimate"] = updated
+            state["step"] = None
+            send_whatsapp(MANAGER_NUMBER, "Updated!\n\n" + format_estimate(updated))
+        except Exception as e:
+            state["step"] = None
+            send_whatsapp(MANAGER_NUMBER, "Adjustment failed: " + str(e))
+        return "", 200
+ 
+    if state["step"] == "awaiting_name":
+        state["client_name"] = body
+        state["step"] = "awaiting_phone"
+        send_whatsapp(MANAGER_NUMBER, "Got it! Now send the client phone number:")
+        return "", 200
+ 
+    if state["step"] == "awaiting_phone":
+        state["client_phone"] = body
+        name = state["client_name"]
+        phone = state["client_phone"]
+        est = state["estimate"]
+        job_id = state["job_id"]
+        send_whatsapp(MANAGER_NUMBER, "Generating quote for " + str(name) + "...")
+        try:
+            pdf_path = generate_quote_pdf(est, name, phone, job_id)
+            with open(pdf_path, "rb") as f:
+                upload = requests.post("https://file.io/?expires=1d", files={"file": f})
+            pdf_url = upload.json().get("link", "")
+            if pdf_url:
+                send_whatsapp(MANAGER_NUMBER, "Quote ready! Forward to client:\n" + pdf_url)
+            else:
+                send_whatsapp(MANAGER_NUMBER, "PDF upload failed. Try approving again.")
+        except Exception as e:
+            send_whatsapp(MANAGER_NUMBER, "Quote generation failed: " + str(e))
+        reset_state()
+        return "", 200
+ 
+    if body_upper == "APPROVE":
+        if not state["estimate"]:
+            send_whatsapp(MANAGER_NUMBER, "No active estimate. Send a video or photo first.")
+            return "", 200
+        state["step"] = "awaiting_name"
+        send_whatsapp(MANAGER_NUMBER, "What is the client name?")
+        return "", 200
+ 
+    if body_upper == "EDIT":
+        if not state["estimate"]:
+            send_whatsapp(MANAGER_NUMBER, "No active estimate. Send a video or photo first.")
+            return "", 200
+        state["step"] = "awaiting_edit"
+        send_whatsapp(MANAGER_NUMBER,
+            "What would you like to change?\n\n"
+            "Examples:\n"
+            "- Make boxes 20 and final price 5000\n"
+            "- Remove the carpenter\n"
+            "- Add 1 extra truck\n"
+            "- Set client price to 4500 SR\n\n"
+            "Type your instructions:")
+        return "", 200
+ 
+    if body_upper == "REJECT":
+        if state["estimate"]:
+            reset_state()
+            send_whatsapp(MANAGER_NUMBER, "Estimate rejected.")
+        else:
+            send_whatsapp(MANAGER_NUMBER, "No active estimate.")
+        return "", 200
+ 
+    if num_media > 0:
+        send_whatsapp(MANAGER_NUMBER, "Got " + str(num_media) + " file(s)! Analyzing with Claude...")
+        media_urls = [request.form.get("MediaUrl" + str(i)) for i in range(num_media)]
+        try:
+            estimate = analyze_media_with_claude(media_urls)
+            job_id = "JOB-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
+            state["job_id"] = job_id
+            state["estimate"] = estimate
+            state["step"] = None
+            send_whatsapp(MANAGER_NUMBER, format_estimate(estimate))
+        except Exception as e:
+            send_whatsapp(MANAGER_NUMBER, "Analysis failed: " + str(e))
+        return "", 200
+ 
+    send_whatsapp(MANAGER_NUMBER,
+        "NoBiggie Bot\n\n"
+        "Send photos or videos to get an estimate.\n\n"
+        "Then reply:\n"
+        "APPROVE\n"
+        "EDIT\n"
+        "REJECT")
+    return "", 200
+ 
+ 
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port)
+                         "source": {"type": "base64", "media_type": "image/jpeg", "data": fb64}
                     })
         else:
             content.append({
