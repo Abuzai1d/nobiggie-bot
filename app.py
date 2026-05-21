@@ -5,6 +5,7 @@ import requests
 import tempfile
 import random
 import string
+import threading
 from flask import Flask, request
 from twilio.rest import Client
 import anthropic
@@ -47,7 +48,7 @@ def send_wa(body):
 
 
 def download_media(url):
-    r = requests.get(url, auth=(TWILIO_SID, TWILIO_TOKEN))
+    r = requests.get(url, auth=(TWILIO_SID, TWILIO_TOKEN), timeout=30)
     mime = r.headers.get("Content-Type", "image/jpeg").split(";")[0]
     return base64.standard_b64encode(r.content).decode("utf-8"), mime
 
@@ -137,6 +138,47 @@ def format_estimate(est):
     return msg
 
 
+def process_media_background(media_urls):
+    try:
+        estimate = analyze_media(media_urls)
+        job_id = "JOB-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
+        new_state = {"job_id": job_id, "estimate": estimate, "step": None, "client_name": None, "client_phone": None}
+        save_state(new_state)
+        send_wa(format_estimate(estimate))
+    except Exception as e:
+        send_wa("Analysis failed: " + str(e))
+
+
+def process_edit_background(estimate, comment):
+    try:
+        updated = apply_edit(estimate, comment)
+        state = load_state()
+        state["estimate"] = updated
+        state["step"] = None
+        save_state(state)
+        send_wa("Updated!\n\n" + format_estimate(updated))
+    except Exception as e:
+        state = load_state()
+        state["step"] = None
+        save_state(state)
+        send_wa("Failed: " + str(e))
+
+
+def generate_quote_background(est, name, phone, job_id):
+    try:
+        pdf_path = generate_quote_pdf(est, name, phone, job_id)
+        with open(pdf_path, "rb") as pf:
+            up = requests.post("https://file.io/?expires=1d", files={"file": pf})
+        url = up.json().get("link", "")
+        if url:
+            send_wa("Quote ready! Forward to client:\n" + url)
+        else:
+            send_wa("PDF upload failed.")
+    except Exception as e:
+        send_wa("Quote failed: " + str(e))
+    reset_state()
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     from_number = request.form.get("From", "")
@@ -150,17 +192,12 @@ def webhook():
     state = load_state()
 
     if state["step"] == "awaiting_edit":
+        state["step"] = None
+        save_state(state)
         send_wa("Adjusting estimate...")
-        try:
-            updated = apply_edit(state["estimate"], body)
-            state["estimate"] = updated
-            state["step"] = None
-            save_state(state)
-            send_wa("Updated!\n\n" + format_estimate(updated))
-        except Exception as e:
-            state["step"] = None
-            save_state(state)
-            send_wa("Failed: " + str(e))
+        t = threading.Thread(target=process_edit_background, args=(state["estimate"], body))
+        t.daemon = True
+        t.start()
         return "", 200
 
     if state["step"] == "awaiting_name":
@@ -173,22 +210,14 @@ def webhook():
     if state["step"] == "awaiting_phone":
         state["client_phone"] = body
         name = state["client_name"]
-        phone = state["client_phone"]
+        phone = body
         est = state["estimate"]
         job_id = state["job_id"]
+        save_state(state)
         send_wa("Generating quote for " + str(name) + "...")
-        try:
-            pdf_path = generate_quote_pdf(est, name, phone, job_id)
-            with open(pdf_path, "rb") as pf:
-                up = requests.post("https://file.io/?expires=1d", files={"file": pf})
-            url = up.json().get("link", "")
-            if url:
-                send_wa("Quote ready! Forward to client:\n" + url)
-            else:
-                send_wa("PDF upload failed.")
-        except Exception as e:
-            send_wa("Quote failed: " + str(e))
-        reset_state()
+        t = threading.Thread(target=generate_quote_background, args=(est, name, phone, job_id))
+        t.daemon = True
+        t.start()
         return "", 200
 
     if bu == "APPROVE":
@@ -215,16 +244,11 @@ def webhook():
         return "", 200
 
     if num_media > 0:
-        send_wa("Got " + str(num_media) + " file(s)! Analyzing...")
+        send_wa("Got " + str(num_media) + " file(s)! Analyzing... this takes about 30 seconds")
         media_urls = [request.form.get("MediaUrl" + str(i)) for i in range(num_media)]
-        try:
-            estimate = analyze_media(media_urls)
-            job_id = "JOB-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
-            new_state = {"job_id": job_id, "estimate": estimate, "step": None, "client_name": None, "client_phone": None}
-            save_state(new_state)
-            send_wa(format_estimate(estimate))
-        except Exception as e:
-            send_wa("Analysis failed: " + str(e))
+        t = threading.Thread(target=process_media_background, args=(media_urls,))
+        t.daemon = True
+        t.start()
         return "", 200
 
     send_wa("NoBiggie Bot\nSend photos or videos to get an estimate.\nThen reply: APPROVE / EDIT / REJECT")
