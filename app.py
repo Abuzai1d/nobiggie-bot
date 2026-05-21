@@ -12,14 +12,16 @@ from quote_generator import generate_quote_pdf
  
 app = Flask(__name__)
  
-TWILIO_SID        = os.environ.get("TWILIO_ACCOUNT_SID",     "AC4cabc297f8ef1ab124a2150c8fbc46f8")
-TWILIO_TOKEN      = os.environ.get("TWILIO_AUTH_TOKEN",      "e7ea89b810289727236c17a9ea572826")
-TWILIO_WA_NUMBER  = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
-MANAGER_NUMBER    = os.environ.get("MANAGER_WHATSAPP_NUMBER", "whatsapp:+966505689200")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY",      "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")
+TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "AC4cabc297f8ef1ab124a2150c8fbc46f8")
+TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "e7ea89b810289727236c17a9ea572826")
+TWILIO_WA_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+MANAGER_NUMBER = os.environ.get("MANAGER_WHATSAPP_NUMBER", "whatsapp:+966505689200")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
  
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+ 
+ANALYSIS_PROMPT = "You are a moving estimator for NoBiggie moving company in Saudi Arabia. Analyze the images/frames and return ONLY this JSON: {\"rooms\": [\"list of rooms\"], \"items\": [\"every item to move\"], \"boxes_count\": 60, \"trucks_count\": 3, \"workers_count\": 4, \"carpenter_needed\": true, \"packer_hours\": 8, \"special_items\": [\"fragile items\"], \"cost_breakdown\": {\"trucks\": 900, \"pakistani_workers\": 400, \"carpenter\": 200, \"filipino_packers_labor\": 960, \"filipino_packers_transport\": 120, \"boxes\": 600, \"bubble_wrap\": 168, \"stretch_wrap\": 175, \"tape\": 35}, \"total_cost\": 3558, \"client_price\": 5058, \"summary\": \"2-3 sentence summary\"}. Pricing: Truck 300 SR, Worker 100 SR/day, Carpenter 200 SR/day, Packers 30 SR/hr per person groups of 4 plus 120 SR transport, Box 10 SR, Bubble wrap 28 SR, Stretch wrap 25 SR, Tape 3.5 SR. client_price = total_cost + 1500 SR margin. Return ONLY valid JSON, no markdown."
  
 state = {
     "job_id": None,
@@ -38,8 +40,8 @@ def reset_state():
     state["client_phone"] = None
  
  
-def send_whatsapp(to, body):
-    twilio_client.messages.create(from_=TWILIO_WA_NUMBER, to=to, body=body)
+def send_wa(body):
+    twilio_client.messages.create(from_=TWILIO_WA_NUMBER, to=MANAGER_NUMBER, body=body)
  
  
 def download_media(url):
@@ -48,30 +50,187 @@ def download_media(url):
     return base64.standard_b64encode(r.content).decode("utf-8"), mime
  
  
-def analyze_media_with_claude(media_urls):
+def analyze_media(media_urls):
+    import subprocess
+    import glob
+ 
     content = []
     for url in media_urls:
         b64, mime = download_media(url)
         if "video" in mime:
-            import subprocess
-            import glob
             with tempfile.TemporaryDirectory() as tmpdir:
-                video_path = os.path.join(tmpdir, "video.mp4")
-                with open(video_path, "wb") as f:
+                vpath = os.path.join(tmpdir, "v.mp4")
+                with open(vpath, "wb") as f:
                     f.write(base64.b64decode(b64))
                 subprocess.run(
-                    ["ffmpeg", "-i", video_path, "-vf", "fps=1/2",
-                     os.path.join(tmpdir, "frame_%03d.jpg"), "-y"],
+                    ["ffmpeg", "-i", vpath, "-vf", "fps=1/2",
+                     os.path.join(tmpdir, "f_%03d.jpg"), "-y"],
                     capture_output=True
                 )
-                frames = sorted(glob.glob(os.path.join(tmpdir, "frame_*.jpg")))[:6]
-                for frame_path in frames:
-                    with open(frame_path, "rb") as ff:
-                        fb64 = base64.standard_b64encode(ff.read()).decode("utf-8")
-                    content.append({
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": "image/jpeg", "data": fb64}
-                    })
+                for fp in sorted(glob.glob(os.path.join(tmpdir, "f_*.jpg")))[:6]:
+                    with open(fp, "rb") as ff:
+                        fb = base64.standard_b64encode(ff.read()).decode("utf-8")
+                    content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": fb}})
+        else:
+            content.append({"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}})
+ 
+    content.append({"type": "text", "text": ANALYSIS_PROMPT})
+ 
+    resp = claude_client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=2000,
+        messages=[{"role": "user", "content": content}]
+    )
+    raw = resp.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return json.loads(raw.strip())
+ 
+ 
+def apply_edit(estimate, comment):
+    edit_prompt = "Adjust this move estimate: " + json.dumps(estimate) + " Instructions: " + comment + " Recalculate all costs. client_price = total_cost + 1500 SR unless manager sets specific price. Return ONLY updated JSON, no markdown."
+    resp = claude_client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=2000,
+        messages=[{"role": "user", "content": edit_prompt}]
+    )
+    raw = resp.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return json.loads(raw.strip())
+ 
+ 
+def format_estimate(est):
+    cb = est.get("cost_breakdown", {})
+    items = est.get("items", [])
+    preview = "\n".join(["- " + str(x) for x in items[:12]])
+    if len(items) > 12:
+        preview += "\n... +" + str(len(items) - 12) + " more"
+    sp = est.get("special_items", [])
+    special = "\n".join(["* " + str(x) for x in sp]) if sp else "None"
+    packers = cb.get("filipino_packers_labor", 0) + cb.get("filipino_packers_transport", 0)
+    mats = cb.get("boxes", 0) + cb.get("bubble_wrap", 0) + cb.get("stretch_wrap", 0) + cb.get("tape", 0)
+    msg = "NoBiggie Move Estimate\n\n"
+    msg += "Rooms: " + ", ".join(est.get("rooms", [])) + "\n\n"
+    msg += "Items (" + str(len(items)) + " total):\n" + preview + "\n\n"
+    msg += "Special Handling:\n" + special + "\n\n"
+    msg += "Resources:\n"
+    msg += "- " + str(est.get("trucks_count", 0)) + " Trucks\n"
+    msg += "- " + str(est.get("workers_count", 0)) + " Workers\n"
+    msg += "- " + ("1 Carpenter" if est.get("carpenter_needed") else "No Carpenter") + "\n"
+    msg += "- 4 Packers (" + str(est.get("packer_hours", 0)) + " hrs)\n"
+    msg += "- " + str(est.get("boxes_count", 0)) + " Boxes\n\n"
+    msg += "Costs:\n"
+    msg += "Trucks: " + str(cb.get("trucks", 0)) + " SR\n"
+    msg += "Workers: " + str(cb.get("pakistani_workers", 0)) + " SR\n"
+    msg += "Carpenter: " + str(cb.get("carpenter", 0)) + " SR\n"
+    msg += "Packers: " + str(packers) + " SR\n"
+    msg += "Materials: " + str(mats) + " SR\n"
+    msg += "Our Cost: " + str(est.get("total_cost", 0)) + " SR\n"
+    msg += "Margin: 1500 SR\n"
+    msg += "CLIENT PRICE: " + str(est.get("client_price", 0)) + " SR\n\n"
+    msg += str(est.get("summary", "")) + "\n\n"
+    msg += "Reply: APPROVE / EDIT / REJECT"
+    return msg
+ 
+ 
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    from_number = request.form.get("From", "")
+    body = request.form.get("Body", "").strip()
+    num_media = int(request.form.get("NumMedia", 0))
+ 
+    if from_number != MANAGER_NUMBER:
+        return "", 200
+ 
+    bu = body.upper()
+ 
+    if state["step"] == "awaiting_edit":
+        send_wa("Adjusting estimate...")
+        try:
+            updated = apply_edit(state["estimate"], body)
+            state["estimate"] = updated
+            state["step"] = None
+            send_wa("Updated!\n\n" + format_estimate(updated))
+        except Exception as e:
+            state["step"] = None
+            send_wa("Failed: " + str(e))
+        return "", 200
+ 
+    if state["step"] == "awaiting_name":
+        state["client_name"] = body
+        state["step"] = "awaiting_phone"
+        send_wa("Got it! Now send the client phone number:")
+        return "", 200
+ 
+    if state["step"] == "awaiting_phone":
+        state["client_phone"] = body
+        name = state["client_name"]
+        phone = state["client_phone"]
+        est = state["estimate"]
+        job_id = state["job_id"]
+        send_wa("Generating quote for " + str(name) + "...")
+        try:
+            pdf_path = generate_quote_pdf(est, name, phone, job_id)
+            with open(pdf_path, "rb") as f:
+                up = requests.post("https://file.io/?expires=1d", files={"file": f})
+            url = up.json().get("link", "")
+            if url:
+                send_wa("Quote ready! Forward to client:\n" + url)
+            else:
+                send_wa("PDF upload failed.")
+        except Exception as e:
+            send_wa("Quote failed: " + str(e))
+        reset_state()
+        return "", 200
+ 
+    if bu == "APPROVE":
+        if not state["estimate"]:
+            send_wa("No active estimate. Send a video or photo first.")
+            return "", 200
+        state["step"] = "awaiting_name"
+        send_wa("What is the client name?")
+        return "", 200
+ 
+    if bu == "EDIT":
+        if not state["estimate"]:
+            send_wa("No active estimate. Send a video or photo first.")
+            return "", 200
+        state["step"] = "awaiting_edit"
+        send_wa("What to change? Examples:\n- Make boxes 20 and price 5000\n- Remove carpenter\n- Add 1 truck\n- Set price to 4500 SR")
+        return "", 200
+ 
+    if bu == "REJECT":
+        reset_state()
+        send_wa("Estimate rejected.")
+        return "", 200
+ 
+    if num_media > 0:
+        send_wa("Got " + str(num_media) + " file(s)! Analyzing...")
+        media_urls = [request.form.get("MediaUrl" + str(i)) for i in range(num_media)]
+        try:
+            estimate = analyze_media(media_urls)
+            job_id = "JOB-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
+            state["job_id"] = job_id
+            state["estimate"] = estimate
+            state["step"] = None
+            send_wa(format_estimate(estimate))
+        except Exception as e:
+            send_wa("Analysis failed: " + str(e))
+        return "", 200
+ 
+    send_wa("NoBiggie Bot\nSend photos or videos to get an estimate.\nThen reply: APPROVE / EDIT / REJECT")
+    return "", 200
+ 
+ 
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port)
+                     })
         else:
             content.append({
                 "type": "image",
