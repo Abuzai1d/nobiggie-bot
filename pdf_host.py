@@ -2,8 +2,7 @@ import requests
 import base64
 import os
 
-
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "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")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 REPO = "Abuzai1d/nobiggie-bot"
 
 
