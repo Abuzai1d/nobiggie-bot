@@ -58,23 +58,35 @@ def analyze_media(media_urls):
     import glob
     content = []
     for url in media_urls:
-        b64, mime = download_media(url)
-        if "video" in mime:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                vpath = os.path.join(tmpdir, "v.mp4")
-                with open(vpath, "wb") as vf:
-                    vf.write(base64.b64decode(b64))
-                subprocess.run(
-                    ["ffmpeg", "-i", vpath, "-vf", "fps=1/2",
-                     os.path.join(tmpdir, "f_%03d.jpg"), "-y"],
-                    capture_output=True
-                )
-                for fp in sorted(glob.glob(os.path.join(tmpdir, "f_*.jpg")))[:6]:
-                    with open(fp, "rb") as ff:
-                        fb = base64.standard_b64encode(ff.read()).decode("utf-8")
-                    content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": fb}})
-        else:
-            content.append({"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}})
+        try:
+            r = requests.get(url, auth=(TWILIO_SID, TWILIO_TOKEN), timeout=60)
+            mime = r.headers.get("Content-Type", "image/jpeg").split(";")[0]
+            raw_bytes = r.content
+            send_wa("File received: " + mime + " size: " + str(len(raw_bytes)) + " bytes")
+            if "video" in mime:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    vpath = os.path.join(tmpdir, "v.mp4")
+                    with open(vpath, "wb") as vf:
+                        vf.write(raw_bytes)
+                    result = subprocess.run(
+                        ["ffmpeg", "-i", vpath, "-vf", "fps=1/3", "-vframes", "4",
+                         os.path.join(tmpdir, "f_%03d.jpg"), "-y"],
+                        capture_output=True, timeout=60
+                    )
+                    frames = sorted(glob.glob(os.path.join(tmpdir, "f_*.jpg")))[:4]
+                    send_wa("Extracted " + str(len(frames)) + " frames from video")
+                    for fp in frames:
+                        with open(fp, "rb") as ff:
+                            fb = base64.standard_b64encode(ff.read()).decode("utf-8")
+                        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": fb}})
+            else:
+                b64 = base64.standard_b64encode(raw_bytes).decode("utf-8")
+                content.append({"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}})
+        except Exception as e:
+            send_wa("Error processing file: " + str(e))
+            raise
+    if not content:
+        raise Exception("No media could be processed")
     content.append({"type": "text", "text": ANALYSIS_PROMPT})
     resp = claude_client.messages.create(
         model="claude-sonnet-4-5",
